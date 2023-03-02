@@ -23,6 +23,7 @@ import (
 	"crypto/x509"
 	"encoding/pem"
 	"fmt"
+	"k8s.io/api/certificates/v1beta1"
 	"os"
 	"time"
 
@@ -97,7 +98,6 @@ func (o *operator) CreateKubeConfig(user *iamv1alpha2.User) error {
 		return err
 	}
 
-	// create a new CSR
 	var ca []byte
 	if len(o.config.CAData) > 0 {
 		ca = o.config.CAData
@@ -109,7 +109,8 @@ func (o *operator) CreateKubeConfig(user *iamv1alpha2.User) error {
 		}
 	}
 
-	if err = o.createCSR(user.Name); err != nil {
+	// create a new CSR
+	if _, err = o.createCSR(user.Name); err != nil {
 		klog.Errorln(err)
 		return err
 	}
@@ -138,7 +139,7 @@ func (o *operator) CreateKubeConfig(user *iamv1alpha2.User) error {
 		return err
 	}
 
-	// update configmap if it already exist.
+	// update configmap if it already exists.
 	if cm != nil {
 		cm.Data = map[string]string{kubeconfigFileName: string(kubeconfig)}
 		if _, err = o.k8sClient.CoreV1().ConfigMaps(constants.KubeSphereControlNamespace).Update(context.Background(), cm, metav1.UpdateOptions{}); err != nil {
@@ -190,6 +191,35 @@ func (o *operator) GetKubeConfig(username string) (string, error) {
 		return "", err
 	}
 
+	// client certificate has expired or will expire in 3 days and needs to be renewed
+	if isExpired(configMap, username) {
+		csr, err := o.createCSR(username)
+		if err != nil {
+			klog.Errorln(err)
+			return "", err
+		}
+		// wait for csr to be approved
+		csr, err = o.waitForApproveCSR(csr)
+		if err != nil {
+			klog.Errorln(err)
+			return "", err
+		}
+		// update configmap
+		configMap = applyCert(configMap, csr)
+		newConfigMap, err := o.k8sClient.CoreV1().ConfigMaps(constants.KubeSphereControlNamespace).Update(context.Background(), configMap, metav1.UpdateOptions{})
+		if err != nil {
+			klog.Errorln(err)
+			return "", err
+		}
+		// reload new kubeconfig
+		data := []byte(newConfigMap.Data[kubeconfigFileName])
+		kubeconfig, err = clientcmd.Load(data)
+		if err != nil {
+			klog.Errorln(err)
+			return "", err
+		}
+	}
+
 	masterURL := o.masterURL
 	// server host override
 	if cluster := kubeconfig.Clusters[defaultClusterName]; cluster != nil && masterURL != "" {
@@ -205,7 +235,7 @@ func (o *operator) GetKubeConfig(username string) (string, error) {
 	return string(data), nil
 }
 
-func (o *operator) createCSR(username string) error {
+func (o *operator) createCSR(username string) (*certificatesv1.CertificateSigningRequest, error) {
 	csrConfig := &certutil.Config{
 		CommonName:   username,
 		Organization: nil,
@@ -216,28 +246,26 @@ func (o *operator) createCSR(username string) error {
 	x509csr, x509key, err := pkiutil.NewCSRAndKey(csrConfig)
 	if err != nil {
 		klog.Errorln(err)
-		return err
+		return nil, err
 	}
 
 	var csrBuffer, keyBuffer bytes.Buffer
 	if err = pem.Encode(&keyBuffer, &pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(x509key)}); err != nil {
 		klog.Errorln(err)
-		return err
+		return nil, err
 	}
 
 	var csrBytes []byte
 	if csrBytes, err = x509.CreateCertificateRequest(rand.Reader, x509csr, x509key); err != nil {
 		klog.Errorln(err)
-		return err
+		return nil, err
 	}
 
 	if err = pem.Encode(&csrBuffer, &pem.Block{Type: "CERTIFICATE REQUEST", Bytes: csrBytes}); err != nil {
 		klog.Errorln(err)
-		return err
+		return nil, err
 	}
 
-	csr := csrBuffer.Bytes()
-	key := keyBuffer.Bytes()
 	csrName := fmt.Sprintf("%s-csr-%d", username, time.Now().Unix())
 	k8sCSR := &certificatesv1.CertificateSigningRequest{
 		TypeMeta: metav1.TypeMeta{
@@ -247,10 +275,10 @@ func (o *operator) createCSR(username string) error {
 		ObjectMeta: metav1.ObjectMeta{
 			Name:        csrName,
 			Labels:      map[string]string{constants.UsernameLabelKey: username},
-			Annotations: map[string]string{privateKeyAnnotation: string(key)},
+			Annotations: map[string]string{privateKeyAnnotation: keyBuffer.String()},
 		},
 		Spec: certificatesv1.CertificateSigningRequestSpec{
-			Request:    csr,
+			Request:    csrBuffer.Bytes(),
 			SignerName: certificatesv1.KubeAPIServerClientSignerName,
 			Usages:     []certificatesv1.KeyUsage{certificatesv1.UsageKeyEncipherment, certificatesv1.UsageClientAuth, certificatesv1.UsageDigitalSignature},
 			Username:   username,
@@ -259,12 +287,41 @@ func (o *operator) createCSR(username string) error {
 	}
 
 	// create csr
-	if _, err = o.k8sClient.CertificatesV1().CertificateSigningRequests().Create(context.Background(), k8sCSR, metav1.CreateOptions{}); err != nil {
+	csr, err := o.k8sClient.CertificatesV1().CertificateSigningRequests().Create(context.Background(), k8sCSR, metav1.CreateOptions{})
+	if err != nil {
 		klog.Errorln(err)
-		return err
+		return nil, err
 	}
 
-	return nil
+	return csr, nil
+}
+
+func (o *operator) waitForApproveCSR(req *certificatesv1.CertificateSigningRequest) (*certificatesv1.CertificateSigningRequest, error) {
+	ch := make(chan struct{}, 1)
+	errCh := make(chan error, 1)
+	var csr *certificatesv1.CertificateSigningRequest
+	ctx, _ := context.WithTimeout(context.Background(), 5*time.Second)
+	go func() {
+		for {
+			csr, err := o.k8sClient.CertificatesV1beta1().CertificateSigningRequests().Get(ctx, req.ObjectMeta.Name, metav1.GetOptions{})
+			if err != nil {
+				errCh <- err
+			}
+			if len(csr.Status.Conditions) > 0 && csr.Status.Conditions[0].Type == v1beta1.CertificateApproved {
+				ch <- struct{}{}
+				break
+			}
+			time.Sleep(1 * time.Second)
+		}
+	}()
+	select {
+	case <-ch:
+		return csr, nil
+	case err := <-errCh:
+		return nil, err
+	case <-ctx.Done():
+		return nil, fmt.Errorf("wait for csr to be approve timeout")
+	}
 }
 
 // UpdateKubeconfig Update client key and client certificate after CertificateSigningRequest has been approved
@@ -344,6 +401,5 @@ func isExpired(cm *corev1.ConfigMap, username string) bool {
 		}
 		return false
 	}
-	//ignore the kubeconfig, since it's not approved yet.
-	return false
+	return true
 }
